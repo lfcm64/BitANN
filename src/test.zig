@@ -1,4 +1,5 @@
 test {
-    _ = @import("cache.zig");
-    _ = @import("array_pool.zig");
+    _ = @import("io.zig");
+    _ = @import("ppool.zig");
+    _ = @import("pcache.zig");
 }
