@@ -2,17 +2,17 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-const DoublyLinkedList = std.DoublyLinkedList(PNode);
+const DoublyLinkedList = std.DoublyLinkedList(PHandler);
 const LNode = DoublyLinkedList.Node;
 
 const AutoHashMapUnmanaged = std.AutoHashMapUnmanaged(u32, *LNode);
 
 pub const PEviction = struct {
     ptr: *anyopaque,
-    evict: *const fn (*anyopaque, node: PNode) anyerror!void, // function called every time a node is evicted from the cache
+    evict: *const fn (*anyopaque, handler: PHandler) anyerror!void, // function called every time a node is evicted from the cache
 };
 
-pub const PNode = struct {
+pub const PHandler = struct {
     pnum: u32, // page number
     dirty: bool, // wether the cache page differ from the disk page
     rpage: []u8,
@@ -48,30 +48,30 @@ pub const PCache = struct {
         cache.allocator.destroy(cache);
     }
 
-    pub fn get(self: *PCache, pnum: u32) ?*PNode {
-        if (self.pmap.get(pnum)) |pnode| {
-            self.plist.remove(pnode);
-            self.plist.prepend(pnode);
+    pub fn get(cache: *PCache, pnum: u32) ?*PHandler {
+        if (cache.pmap.get(pnum)) |pnode| {
+            cache.plist.remove(pnode);
+            cache.plist.prepend(pnode);
             return &pnode.data;
         }
         return null;
     }
 
-    pub fn put(self: *PCache, pnum: u32, rpage: []u8) !void {
-        if (self.pmap.get(pnum)) |pnode| {
+    pub fn put(cache: *PCache, pnum: u32, rpage: []u8) !void {
+        if (cache.pmap.get(pnum)) |pnode| {
             @memcpy(pnode.data.rpage, rpage);
             pnode.data.dirty = true;
 
-            self.plist.remove(pnode);
-            self.plist.prepend(pnode);
+            cache.plist.remove(pnode);
+            cache.plist.prepend(pnode);
             return;
         }
 
-        if (self.pmap.count() >= self.size) {
-            try self.evict();
+        if (cache.pmap.count() >= cache.size) {
+            try cache.evict();
         }
 
-        const lnode = try self.allocator.create(DoublyLinkedList.Node);
+        const lnode = try cache.allocator.create(DoublyLinkedList.Node);
         lnode.* = .{
             .data = .{
                 .pnum = pnum,
@@ -80,15 +80,19 @@ pub const PCache = struct {
             },
         };
 
-        self.plist.prepend(lnode);
-        try self.pmap.put(self.allocator, pnum, lnode);
+        cache.plist.prepend(lnode);
+        try cache.pmap.put(cache.allocator, pnum, lnode);
     }
 
-    pub fn flush(self: *PCache) !void {
-        var it = self.plist.first;
+    pub fn contains(cache: *PCache, pnum: u32) bool {
+        return cache.pmap.contains(pnum);
+    }
+
+    pub fn flush(cache: *PCache) !void {
+        var it = cache.plist.first;
         while (it) |node| {
             if (node.data.dirty) {
-                try self.eviction.evict(self.eviction.ptr, node.data);
+                try cache.eviction.evict(cache.eviction.ptr, node.data);
                 node.data.dirty = false;
             }
             it = node.next;
@@ -111,14 +115,14 @@ pub const PCache = struct {
 const TestEviction = struct {
     counter: u32 = 0,
 
-    fn evict(ptr: *anyopaque, node: PNode) anyerror!void {
-        _ = node;
-        const self: *TestEviction = @ptrCast(@alignCast(ptr));
-        self.counter += 1;
+    fn evict(ptr: *anyopaque, handler: PHandler) anyerror!void {
+        _ = handler;
+        const cache: *TestEviction = @ptrCast(@alignCast(ptr));
+        cache.counter += 1;
     }
 
-    fn getEviction(self: *TestEviction) PEviction {
-        return PEviction{ .ptr = self, .evict = evict };
+    fn getEviction(cache: *TestEviction) PEviction {
+        return PEviction{ .ptr = cache, .evict = evict };
     }
 };
 

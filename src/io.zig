@@ -114,5 +114,5 @@ test "invalid page size errors" {
     var wrong_buf = [_]u8{0} ** 512;
 
     try testing.expectError(error.InvalidPageSize, writer.writePage(0, &wrong_buf));
-    try testing.expectError(error.InvalidPageSize, reader.readPageInto(0, &wrong_buf));
+    try testing.expectError(error.InvalidPageSize, reader.readPage(0, &wrong_buf));
 }

@@ -2,19 +2,17 @@ const std = @import("std");
 const io = @import("io.zig");
 const cache = @import("pcache.zig");
 const pool = @import("ppool.zig");
-const page = @import("page.zig");
+const pages = @import("pages.zig");
+const types = @import("types.zig");
 
-const PNode = cache.PNode;
+const PHandler = cache.PHandler;
 const PEviction = cache.PEviction;
-
-const Page = page.Page;
-const PType = page.PType;
 
 const Allocator = std.mem.Allocator;
 
-fn cache_evict(ctx: *anyopaque, pnode: PNode) anyerror!void {
+fn cache_evict(ctx: *anyopaque, handler: *PHandler) anyerror!void {
     const pager: *Pager = @ptrCast(@alignOf(ctx));
-    try pager.pwriter.writePage(pnode.pnum, pnode.rpage);
+    try pager.pwriter.writePage(handler.pnum, handler.rpage);
 }
 
 pub const Pager = struct {
@@ -54,36 +52,50 @@ pub const Pager = struct {
         pager.allocator.destroy(pager);
     }
 
-    pub fn getPage(pager: *Pager, pnum: u32) !Page {
-        if (pager.pcache.get(pnum)) |pnode| {
-            return pnode;
+    pub fn get_meta_page(pager: *Pager) !*PHandler {
+        return pager.get_page(0);
+    }
+
+    pub fn get_page(pager: *Pager, page_num: u32) !*PHandler {
+        try pager.load_page(page_num);
+        return pager.pcache.get(page_num) orelse error.PageNotFound;
+    }
+
+    pub fn alloc_page(pager: *Pager) !*PHandler {
+        const free_page_num = pager.first_free_page();
+
+        if (free_page_num == 0) {
+            const bytes = try pager.ppool.acquire();
+            try pager.pcache.put(free_page_num + 1, bytes);
+
+            return pager.pcache.get(free_page_num + 1) orelse error.PageNotFound;
+        } else {
+            const free_page = try pager.get_page(free_page_num);
+            const header: *types.PageHeader = @ptrCast(@alignCast(free_page.rpage));
+
+            const meta_page_handler = try pager.get_meta_page();
+            const meta_page: *pages.MetaPage = @ptrCast(@alignCast(meta_page_handler.rpage));
+            meta_page.meta.first_free_page = header.next_page;
+            return free_page;
         }
-        const bytes = try pager.ppool.acquire();
-
-        try pager.preader.readPage(pnum, bytes);
-        try pager.pcache.put(pnum, bytes);
-
-        const node = pager.pcache.get(pnum) orelse unreachable;
-        return Page.new(node);
     }
 
-    pub fn getFreePage(pager: *Pager, page_type: PType) !Page {
-        if (try pager.getFirstFreePage()) |fpage| {}
+    pub fn first_free_page(pager: *Pager) u32 {
+        const meta_page_handler = try pager.get_meta_page();
+        const meta_page: *pages.MetaPage = @ptrCast(@alignCast(meta_page_handler.rpage));
+        return meta_page.meta.first_free_page;
     }
 
-    fn getFirstFreePage(pager: *Pager) !?Page {
-        const hpage = try pager.getPage(0);
+    pub fn load_page(pager: *Pager, page_num: u32) !void {
+        if (pager.pcache.contains(page_num)) return;
 
-        if (hpage.nextPage()) |next| {
-            const npage = try pager.getPage(next);
-            hpage.setNextPage(npage.nextPage());
+        const page = try pager.ppool.acquire();
+        try pager.preader.readPage(page_num, page);
 
-            return npage;
-        }
-        return null;
+        try pager.pcache.put(page_num, page);
     }
 
-    pub fn flushCache(pager: *Pager) void {
+    pub fn flush_cache(pager: *Pager) void {
         pager.pcache.flush();
     }
 };
