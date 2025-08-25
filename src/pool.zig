@@ -1,4 +1,9 @@
 const std = @import("std");
+const pages = @import("pages.zig");
+
+const testing = std.testing;
+
+const Page = pages.Page;
 
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -7,52 +12,52 @@ const Node = struct {
     next: ?*@This(),
 };
 
-pub const PPool = struct {
+pub const PagePool = struct {
     allocator: Allocator,
     arena: ArenaAllocator,
 
-    psize: usize,
+    page_size: usize,
 
     free_list: ?*Node = null,
 
-    pub fn init(allocator: Allocator, psize: usize) !*PPool {
-        const pool = try allocator.create(PPool);
+    pub fn init(allocator: Allocator, page_size: usize) !*PagePool {
+        const pool = try allocator.create(PagePool);
 
         pool.* = .{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
-            .psize = psize,
+            .page_size = page_size,
         };
         return pool;
     }
 
-    pub fn initPreheated(allocator: Allocator, size: usize, psize: usize) !*PPool {
-        var pool = try PPool.init(allocator, psize);
+    pub fn initPreheated(allocator: Allocator, size: usize, page_size: usize) !*PagePool {
+        var pool = try PagePool.init(allocator, page_size);
         try pool.preheat(size);
         return pool;
     }
 
-    pub fn deinit(pool: *PPool) void {
+    pub fn deinit(pool: *PagePool) void {
         pool.arena.deinit();
         pool.allocator.destroy(pool);
     }
 
-    pub fn acquire(pool: *PPool) ![]u8 {
+    pub fn acquire(pool: *PagePool) !Page {
         if (pool.free_list) |node| {
             pool.free_list = node.next;
             const arr = @as([*]u8, @ptrCast(@alignCast(node)));
-            return arr[0..pool.psize];
+            return arr[0..pool.page_size];
         }
         return pool.allocNew();
     }
 
-    pub fn release(pool: *PPool, rpage: []u8) void {
-        const node: *Node = @ptrCast(@alignCast(rpage.ptr));
+    pub fn release(pool: *PagePool, page: Page) void {
+        const node: *Node = @ptrCast(@alignCast(page.ptr));
         node.next = pool.free_list;
         pool.free_list = node;
     }
 
-    pub fn preheat(pool: *PPool, size: usize) !void {
+    pub fn preheat(pool: *PagePool, size: usize) !void {
         var i: usize = 0;
         while (i < size) : (i += 1) {
             const rpage = try pool.allocNew();
@@ -60,33 +65,30 @@ pub const PPool = struct {
         }
     }
 
-    fn allocNew(pool: *PPool) ![]u8 {
-        const total_size = @max(@sizeOf(Node), @sizeOf(u8) * pool.psize);
+    fn allocNew(pool: *PagePool) !Page {
+        const total_size = @max(@sizeOf(Node), @sizeOf(u8) * pool.page_size);
         const alignment = @max(@alignOf(Node), @alignOf(u8));
 
         const bytes = try pool.arena.allocator().alignedAlloc(u8, alignment, total_size);
         const arr = @as([*]u8, @ptrCast(@alignCast(bytes)));
-        return arr[0..pool.psize];
+        return arr[0..pool.page_size];
     }
 };
 
 test "acquire/release" {
-    const testing = std.testing;
-
-    var pool = try PPool.init(testing.allocator, 256);
+    var pool = try PagePool.init(testing.allocator, 256);
     defer pool.deinit();
 
     const page = try pool.acquire();
-    try testing.expect(page.len == 256);
+    try testing.expectEqual(page.len, 256);
 
     pool.release(page);
     const reused = try pool.acquire();
-    try testing.expect(reused.ptr == page.ptr);
+    try testing.expectEqual(reused.ptr, page.ptr);
 }
 
 test "multiple release/acquire" {
-    const testing = std.testing;
-    var pool = try PPool.init(testing.allocator, 128);
+    var pool = try PagePool.init(testing.allocator, 128);
     defer pool.deinit();
 
     const page1 = try pool.acquire();
@@ -101,14 +103,12 @@ test "multiple release/acquire" {
     const reused1 = try pool.acquire();
     const reused2 = try pool.acquire();
 
-    try testing.expect(reused1.ptr == ptr2);
-    try testing.expect(reused2.ptr == ptr1);
+    try testing.expectEqual(reused1.ptr, ptr2);
+    try testing.expectEqual(reused2.ptr, ptr1);
 }
 
 test "preheat" {
-    const testing = std.testing;
-
-    var pool = try PPool.init(testing.allocator, 128);
+    var pool = try PagePool.init(testing.allocator, 128);
     defer pool.deinit();
 
     try pool.preheat(3);
@@ -123,9 +123,7 @@ test "preheat" {
 }
 
 test "initPreheated" {
-    const testing = std.testing;
-
-    var pool = try PPool.initPreheated(testing.allocator, 10, 200);
+    var pool = try PagePool.initPreheated(testing.allocator, 10, 200);
     defer pool.deinit();
 
     const p1 = try pool.acquire();

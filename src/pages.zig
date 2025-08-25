@@ -4,41 +4,42 @@ const types = @import("types.zig");
 const mem = std.mem;
 const testing = std.testing;
 
-const PageHeader = types.PageHeader;
-const Metadata = types.Metadata;
+const DBHeader = types.DBHeader;
 const Collection = types.Collection;
 const Cluster = types.Cluster;
 const Vector = types.Vector;
 
 pub const Page = []u8;
 
-pub const MetaPage = packed struct {
-    header: PageHeader,
-    meta: Metadata,
-
-    fn init(page: *MetaPage, meta: Metadata) void {
-        page.header = PageHeader{
-            .page_type = 0,
-            .page_id = 0,
-            .prev_page = 0,
-            .next_page = 0,
-            .flags = 0,
-        };
-        page.meta = meta;
-    }
+pub const PageType = enum(u8) {
+    collection,
+    cluster,
+    vector,
 };
+
+pub const PageHeader = packed struct {
+    page_type: PageType,
+    page_id: u32,
+    next_page: u32,
+};
+
+pub fn db_header(page: Page) *DBHeader {
+    return @ptrCast(@alignCast(page));
+}
+
+pub fn page_header(page: Page) *PageHeader {
+    return @ptrCast(@alignCast(page));
+}
 
 pub const CollectionPage = packed struct {
     header: PageHeader,
     collection_count: u32,
 
-    pub fn init(page: *CollectionPage, page_id: u32, prev_page: u32) void {
+    pub fn init(page: *CollectionPage, page_id: u32) void {
         page.header = PageHeader{
-            .page_type = 1,
+            .page_type = .collection,
             .page_id = page_id,
-            .prev_page = prev_page,
             .next_page = 0,
-            .flags = 0,
         };
         page.collection_count = 0;
     }
@@ -83,6 +84,10 @@ pub const CollectionPage = packed struct {
     }
 };
 
+pub fn collection_page(page: Page) *CollectionPage {
+    return @ptrCast(@alignCast(page));
+}
+
 test "initialization" {
     const page_size = 256;
     const buf = try testing.allocator.alloc(u8, page_size);
@@ -90,22 +95,18 @@ test "initialization" {
 
     @memset(buf, 1);
 
-    const page: *CollectionPage = @ptrCast(@alignCast(buf.ptr));
-    CollectionPage.init(page, 42, 10);
+    const page = collection_page(buf);
+    CollectionPage.init(page, 42);
 
-    try testing.expectEqual(1, page.header.page_type);
+    try testing.expectEqual(PageType.collection, page.header.page_type);
     try testing.expectEqual(42, page.header.page_id);
-    try testing.expectEqual(10, page.header.prev_page);
     try testing.expectEqual(0, page.header.next_page);
-    try testing.expectEqual(0, page.header.flags);
     try testing.expectEqual(0, page.collection_count);
 
-    try testing.expectEqual(1, buf[0]);
+    try testing.expectEqual(@intFromEnum(PageType.collection), buf[0]);
     try testing.expectEqual(42, mem.readInt(u32, buf[1..5], .little));
-    try testing.expectEqual(10, mem.readInt(u32, buf[5..9], .little));
+    try testing.expectEqual(0, mem.readInt(u32, buf[5..9], .little));
     try testing.expectEqual(0, mem.readInt(u32, buf[9..13], .little));
-    try testing.expectEqual(0, buf[13]);
-    try testing.expectEqual(0, mem.readInt(u32, buf[14..18], .little));
 }
 
 test "field modification" {
@@ -116,23 +117,23 @@ test "field modification" {
 
     @memset(buf, 1);
 
-    const page: *CollectionPage = @ptrCast(@alignCast(buf.ptr));
-    CollectionPage.init(page, 42, 10);
+    const page = collection_page(buf);
+    CollectionPage.init(page, 42);
 
     try testing.expectEqual(0, page.header.next_page);
-    try testing.expectEqual(0, mem.readInt(u32, buf[9..13], .little));
+    try testing.expectEqual(0, mem.readInt(u32, buf[5..9], .little));
 
     try testing.expectEqual(0, page.collection_count);
-    try testing.expectEqual(0, mem.readInt(u32, buf[14..18], .little));
+    try testing.expectEqual(0, mem.readInt(u32, buf[9..13], .little));
 
     page.header.next_page = 16;
     page.collection_count = 8;
 
     try testing.expectEqual(16, page.header.next_page);
-    try testing.expectEqual(16, mem.readInt(u32, buf[9..13], .little));
+    try testing.expectEqual(16, mem.readInt(u32, buf[5..9], .little));
 
     try testing.expectEqual(8, page.collection_count);
-    try testing.expectEqual(8, mem.readInt(u32, buf[14..18], .little));
+    try testing.expectEqual(8, mem.readInt(u32, buf[9..13], .little));
 }
 
 test "get/add collection" {
@@ -142,8 +143,8 @@ test "get/add collection" {
 
     @memset(buf, 0);
 
-    const page: *CollectionPage = @ptrCast(@alignCast(buf.ptr));
-    CollectionPage.init(page, 1, 0);
+    const page = collection_page(buf);
+    CollectionPage.init(page, 1);
 
     try testing.expectError(error.IndexOutOfBounds, page.get_collection(0));
 
@@ -173,13 +174,11 @@ pub const ClusterPage = packed struct {
     cluster_count: u32,
     centroid_dim: u32,
 
-    pub fn init(page: *ClusterPage, page_id: u32, prev_page: u32, vector_dimension: u32) void {
+    pub fn init(page: *ClusterPage, page_id: u32, vector_dimension: u32) void {
         page.header = PageHeader{
-            .page_type = 2,
+            .page_type = .vector,
             .page_id = page_id,
-            .prev_page = prev_page,
             .next_page = 0,
-            .flags = 0,
         };
         page.cluster_count = 0;
         page.centroid_dim = vector_dimension;
@@ -243,14 +242,18 @@ pub const ClusterPage = packed struct {
     }
 };
 
+pub fn cluster_page(page: Page) *ClusterPage {
+    return @ptrCast(@alignCast(page));
+}
+
 test "get/add cluster" {
     const page_size = 256;
     const buf = try testing.allocator.alloc(u8, page_size);
     defer testing.allocator.free(buf);
     @memset(buf, 0);
 
-    const page: *ClusterPage = @ptrCast(@alignCast(buf.ptr));
-    ClusterPage.init(page, 1, 0, 3);
+    const page = cluster_page(buf);
+    ClusterPage.init(page, 1, 3);
     try testing.expectError(error.IndexOutOfBounds, page.get_cluster(0));
 
     // Create test clusters
@@ -282,13 +285,11 @@ pub const VectorPage = packed struct {
     vector_count: u32,
     vector_dim: u32,
 
-    pub fn init(page: *VectorPage, page_id: u32, prev_page: u32, vector_dim: u32) void {
+    pub fn init(page: *VectorPage, page_id: u32, vector_dim: u32) void {
         page.header = PageHeader{
-            .page_type = 3,
+            .page_type = .vector,
             .page_id = page_id,
-            .prev_page = prev_page,
             .next_page = 0,
-            .flags = 0,
         };
         page.vector_count = 0;
         page.vector_dim = vector_dim;
@@ -346,14 +347,18 @@ pub const VectorPage = packed struct {
     }
 };
 
+pub fn vector_page(page: Page) *VectorPage {
+    return @ptrCast(@alignCast(page));
+}
+
 test "get/add vector" {
     const page_size = 256;
     const buf = try testing.allocator.alloc(u8, page_size);
     defer testing.allocator.free(buf);
     @memset(buf, 0);
 
-    const page: *VectorPage = @ptrCast(@alignCast(buf.ptr));
-    VectorPage.init(page, 1, 0, 3);
+    const page = vector_page(buf);
+    VectorPage.init(page, 1, 3);
     try testing.expectError(error.IndexOutOfBounds, page.get_vector(0));
 
     // Create test clusters
