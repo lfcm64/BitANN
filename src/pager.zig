@@ -1,139 +1,139 @@
 const std = @import("std");
 const io = @import("io.zig");
-const cache = @import("cache.zig");
-const pool = @import("pool.zig");
 const pages = @import("pages.zig");
 const types = @import("types.zig");
 
+const PagePool = @import("pool.zig");
+const PageCache = @import("cache.zig");
+
 const testing = std.testing;
-
-const PageHandle = cache.PageHandle;
-const EvictionCallBack = cache.EvictionCallBack;
-
 const Allocator = std.mem.Allocator;
 
-fn on_cache_eviction(ctx: *anyopaque, handle: *PageHandle) anyerror!void {
-    if (handle.state != .dirty) return;
+const Page = pages.Page;
+const EvictionCallBack = PageCache.EvictionCallBack;
+
+fn on_cache_eviction(ctx: *anyopaque, page: *Page) anyerror!void {
+    if (page.state != .dirty) return;
     const pager: *Pager = @ptrCast(@alignCast(ctx));
-    try pager.writer.write_page(handle.page_num, handle.page);
+    try pager.writer.write_page(page.page_num, page.raw);
 }
 
-pub const Pager = struct {
-    allocator: Allocator,
+const Pager = @This();
 
-    page_count: u32,
-    page_size: u32,
-    free_list_start: u32,
+allocator: Allocator,
 
-    reader: io.PageReader,
-    writer: io.PageWriter,
+page_count: u32,
+page_size: u32,
+free_list_start: u32,
 
-    pool: *pool.PagePool,
-    cache: *cache.PageCache,
+reader: io.PageReader,
+writer: io.PageWriter,
 
-    pub fn init(allocator: Allocator, file: std.fs.File, header: *types.DBHeader) !*Pager {
-        const pager = try allocator.create(Pager);
-        errdefer allocator.destroy(pager);
+pool: *PagePool,
+cache: *PageCache,
 
-        const eviction_callback = EvictionCallBack{
-            .ptr = pager,
-            .evict_fn = on_cache_eviction,
-        };
+pub fn init(allocator: Allocator, file: std.fs.File, meta: *types.Metadata) !*Pager {
+    const pager = try allocator.create(Pager);
+    errdefer allocator.destroy(pager);
 
-        const page_pool = try pool.PagePool.init(allocator, header.page_size);
-        errdefer page_pool.deinit();
+    const eviction_callback = EvictionCallBack{
+        .ptr = pager,
+        .evict_fn = on_cache_eviction,
+    };
 
-        const page_cache = try cache.PageCache.init(allocator, header.cache_size, eviction_callback);
-        errdefer page_cache.deinit();
+    const page_pool = try PagePool.init(allocator, meta.page_size);
+    errdefer page_pool.deinit();
 
-        pager.* = .{
-            .allocator = allocator,
-            .page_count = header.page_count,
-            .page_size = header.page_size,
-            .free_list_start = header.free_list_start,
-            .reader = io.PageReader.new(file, header.page_size),
-            .writer = io.PageWriter.new(file, header.page_size),
-            .pool = page_pool,
-            .cache = page_cache,
-        };
-        return pager;
+    const page_cache = try PageCache.init(allocator, meta.cache_size, eviction_callback);
+    errdefer page_cache.deinit();
+
+    pager.* = .{
+        .allocator = allocator,
+        .page_count = meta.page_count,
+        .page_size = meta.page_size,
+        .free_list_start = meta.free_list_start,
+        .reader = io.PageReader.new(file, meta.page_size),
+        .writer = io.PageWriter.new(file, meta.page_size),
+        .pool = page_pool,
+        .cache = page_cache,
+    };
+    return pager;
+}
+
+pub fn deinit(pager: *Pager) void {
+    pager.cache.deinit();
+    pager.pool.deinit();
+    pager.allocator.destroy(pager);
+}
+
+pub fn get_page(pager: *Pager, page_num: u32) !*Page {
+    if (page_num >= pager.page_count) return error.IndexOutOfBounds;
+    try pager.load_page(page_num);
+    return pager.cache.get(page_num) orelse error.PageNotFound;
+}
+
+pub fn load_page(pager: *Pager, page_num: u32) !void {
+    if (pager.cache.contains(page_num)) return;
+
+    const raw = try pager.pool.acquire();
+    errdefer pager.pool.release(raw);
+
+    try pager.reader.read_page(page_num, raw);
+
+    const page = Page{ .page_num = page_num, .raw = raw, .state = .clean };
+    try pager.cache.put(page);
+}
+
+pub fn alloc_page(pager: *Pager) !*Page {
+    const free_page_num = pager.free_list_start;
+
+    if (free_page_num == 0) {
+        // No free pages available, allocate a new one
+        const new_page_num = pager.page_count + 1;
+        const raw = try pager.pool.acquire();
+
+        const page = Page{ .page_num = new_page_num, .raw = raw, .state = .not_initialized };
+        try pager.cache.put(page);
+        try pager.set_page_count(new_page_num);
+        return pager.cache.get(new_page_num) orelse error.PageNotFound;
+    } else {
+        // Reuse a free page
+        const page = try pager.get_page(free_page_num);
+        const header = try page.header();
+        try pager.free_list_append(header.next_page);
+        return page;
     }
+}
 
-    pub fn deinit(pager: *Pager) void {
-        pager.cache.deinit();
-        pager.pool.deinit();
-        pager.allocator.destroy(pager);
-    }
+pub fn free_page(pager: *Pager, page_num: u32) !void {
+    const page = try pager.get_page(page_num);
+    const header = try page.header();
 
-    pub fn get_page(pager: *Pager, page_num: u32) !*PageHandle {
-        if (page_num >= pager.page_count) return error.IndexOutOfBounds;
-        try pager.load_page(page_num);
-        return pager.cache.get(page_num) orelse error.PageNotFound;
-    }
+    const current_free = pager.free_list_start;
+    header.next_page = current_free;
+    try pager.free_list_append(page_num);
+    page.state = .not_initialized;
+}
 
-    pub fn load_page(pager: *Pager, page_num: u32) !void {
-        if (pager.cache.contains(page_num)) return;
+fn set_page_count(pager: *Pager, page_count: u32) !void {
+    const page = try pager.get_page(0);
+    const meta_page = try page.unwrap(.metadata);
+    meta_page.meta.page_count = page_count;
+    pager.page_count = page_count;
+    page.state = .dirty;
+}
 
-        const page = try pager.pool.acquire();
-        errdefer pager.pool.release(page);
+fn free_list_append(pager: *Pager, page_num: u32) !void {
+    const page = try pager.get_page(0);
+    const meta_page = try page.unwrap(.metadata);
+    meta_page.meta.free_list_start = page_num;
+    pager.free_list_start = page_num;
+    page.signal_change();
+}
 
-        try pager.reader.read_page(page_num, page);
-
-        const handle = PageHandle{ .page_num = page_num, .page = page, .state = .clean };
-        try pager.cache.put(handle);
-    }
-
-    pub fn alloc_page(pager: *Pager) !*PageHandle {
-        const free_page_num = pager.free_list_start;
-
-        if (free_page_num == 0) {
-            // No free pages available, allocate a new one
-            const new_page_num = pager.page_count + 1;
-            const bytes = try pager.pool.acquire();
-
-            const handle = PageHandle{ .page_num = new_page_num, .page = bytes, .state = .not_initialized };
-            try pager.cache.put(handle);
-            try pager.set_page_count(new_page_num);
-            return pager.cache.get(new_page_num) orelse error.PageNotFound;
-        } else {
-            // Reuse a free page
-            const page_handle = try pager.get_page(free_page_num);
-            const header = pages.page_header(page_handle.page);
-            try pager.free_list_append(header.next_page);
-            return page_handle;
-        }
-    }
-
-    pub fn free_page(pager: *Pager, page_num: u32) !void {
-        const page_handle = try pager.get_page(page_num);
-        const header = pages.page_header(page_handle.page);
-
-        const current_free = pager.free_list_start;
-        header.next_page = current_free;
-        try pager.free_list_append(page_num);
-        page_handle.state = .not_initialized;
-    }
-
-    fn set_page_count(pager: *Pager, page_count: u32) !void {
-        const handle = try pager.get_page(0);
-        const header = pages.db_header(handle.page);
-        header.page_count = page_count;
-        pager.page_count = page_count;
-        handle.state = .dirty;
-    }
-
-    fn free_list_append(pager: *Pager, page_num: u32) !void {
-        const handle = try pager.get_page(0);
-        const header = pages.db_header(handle.page);
-        header.free_list_start = page_num;
-        pager.free_list_start = page_num;
-        handle.state = .dirty;
-    }
-
-    pub fn flush_cache(pager: *Pager) !void {
-        try pager.cache.flush();
-    }
-};
+pub fn flush_cache(pager: *Pager) !void {
+    try pager.cache.flush();
+}
 
 // Helper function to create a temporary test file
 fn create_test_file(allocator: std.mem.Allocator, size: usize) !std.fs.File {
@@ -152,7 +152,7 @@ fn create_test_file(allocator: std.mem.Allocator, size: usize) !std.fs.File {
 
 test "initialization" {
     const allocator = testing.allocator;
-    var header = types.DBHeader{
+    var meta = types.Metadata{
         .cache_size = 5,
         .page_size = 256,
         .free_list_start = 0,
@@ -162,66 +162,66 @@ test "initialization" {
     const file = try create_test_file(allocator, 0);
     defer file.close();
 
-    const pager = try Pager.init(allocator, file, &header);
+    const pager = try Pager.init(allocator, file, &meta);
     defer pager.deinit();
 
-    try testing.expectEqual(pager.page_count, header.page_count);
-    try testing.expectEqual(pager.page_size, header.page_size);
-    try testing.expectEqual(pager.free_list_start, header.free_list_start);
+    try testing.expectEqual(pager.page_count, meta.page_count);
+    try testing.expectEqual(pager.page_size, meta.page_size);
+    try testing.expectEqual(pager.free_list_start, meta.free_list_start);
 }
 
 test "get_page with valid page number" {
     const allocator = testing.allocator;
-    var header = types.DBHeader{
+    var meta = types.Metadata{
         .cache_size = 5,
         .page_size = 256,
         .free_list_start = 0,
         .page_count = 2,
     };
 
-    const file = try create_test_file(allocator, header.page_size * header.page_count);
+    const file = try create_test_file(allocator, meta.page_size * meta.page_count);
     defer file.close();
 
-    const pager = try Pager.init(allocator, file, &header);
+    const pager = try Pager.init(allocator, file, &meta);
     defer pager.deinit();
 
-    const page_handle = try pager.get_page(0);
-    try testing.expectEqual(page_handle.page_num, 0);
-    try testing.expectEqual(page_handle.page.len, header.page_size);
+    const meta_page = try pager.get_page(0);
+    try testing.expectEqual(meta_page.page_num, 0);
+    try testing.expectEqual(meta_page.raw.len, meta.page_size);
 }
 
 test "get_page with invalid page number" {
     const allocator = testing.allocator;
-    var header = types.DBHeader{
+    var meta = types.Metadata{
         .cache_size = 5,
         .page_size = 256,
         .free_list_start = 0,
         .page_count = 4,
     };
 
-    const file = try create_test_file(allocator, header.page_size * header.page_count);
+    const file = try create_test_file(allocator, meta.page_size * meta.page_count);
     defer file.close();
 
-    const pager = try Pager.init(allocator, file, &header);
+    const pager = try Pager.init(allocator, file, &meta);
     defer pager.deinit();
 
-    const result = pager.get_page(header.page_count);
+    const result = pager.get_page(meta.page_count);
     try testing.expectError(error.IndexOutOfBounds, result);
 }
 
 test "load_page caching behavior" {
     const allocator = testing.allocator;
-    var header = types.DBHeader{
+    var meta = types.Metadata{
         .cache_size = 5,
         .page_size = 256,
         .free_list_start = 0,
         .page_count = 10,
     };
 
-    const file = try create_test_file(allocator, header.page_size * header.page_count);
+    const file = try create_test_file(allocator, meta.page_size * meta.page_count);
     defer file.close();
 
-    const pager = try Pager.init(allocator, file, &header);
+    const pager = try Pager.init(allocator, file, &meta);
     defer pager.deinit();
 
     try pager.load_page(1);
@@ -232,43 +232,43 @@ test "load_page caching behavior" {
 
 test "alloc_page when no free pages" {
     const allocator = testing.allocator;
-    var header = types.DBHeader{
+    var meta = types.Metadata{
         .cache_size = 5,
         .page_size = 256,
         .free_list_start = 0,
         .page_count = 10,
     };
 
-    const file = try create_test_file(allocator, header.page_size * header.page_count + 5);
+    const file = try create_test_file(allocator, meta.page_size * meta.page_count + 5);
     defer file.close();
 
-    const pager = try Pager.init(allocator, file, &header);
+    const pager = try Pager.init(allocator, file, &meta);
     defer pager.deinit();
 
     const new_page = try pager.alloc_page();
-    try testing.expectEqual(new_page.page_num, header.page_count + 1);
+    try testing.expectEqual(new_page.page_num, meta.page_count + 1);
     try testing.expectEqual(new_page.state, .not_initialized);
-    try testing.expectEqual(pager.page_count, header.page_count + 1);
+    try testing.expectEqual(pager.page_count, meta.page_count + 1);
 }
 
 test "free_page functionality" {
     const allocator = testing.allocator;
-    var header = types.DBHeader{
+    var meta = types.Metadata{
         .cache_size = 5,
         .page_size = 256,
         .free_list_start = 0,
         .page_count = 10,
     };
 
-    const file = try create_test_file(allocator, header.page_size * header.page_count);
+    const file = try create_test_file(allocator, meta.page_size * meta.page_count);
     defer file.close();
 
-    const pager = try Pager.init(allocator, file, &header);
+    const pager = try Pager.init(allocator, file, &meta);
     defer pager.deinit();
 
     try pager.free_page(5);
 
-    const page_handle = try pager.get_page(5);
+    const page_page = try pager.get_page(5);
     try testing.expectEqual(pager.free_list_start, 5);
-    try testing.expectEqual(page_handle.state, .not_initialized);
+    try testing.expectEqual(page_page.state, .not_initialized);
 }

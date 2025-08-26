@@ -3,7 +3,7 @@ const pages = @import("pages.zig");
 
 const testing = std.testing;
 
-const Page = pages.Page;
+const RawPage = pages.RawPage;
 
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -12,68 +12,68 @@ const Node = struct {
     next: ?*@This(),
 };
 
-pub const PagePool = struct {
-    allocator: Allocator,
-    arena: ArenaAllocator,
+const PagePool = @This();
 
-    page_size: usize,
+allocator: Allocator,
+arena: ArenaAllocator,
 
-    free_list: ?*Node = null,
+page_size: usize,
 
-    pub fn init(allocator: Allocator, page_size: usize) !*PagePool {
-        const pool = try allocator.create(PagePool);
+free_list: ?*Node = null,
 
-        pool.* = .{
-            .allocator = allocator,
-            .arena = std.heap.ArenaAllocator.init(allocator),
-            .page_size = page_size,
-        };
-        return pool;
-    }
+pub fn init(allocator: Allocator, page_size: usize) !*PagePool {
+    const pool = try allocator.create(PagePool);
 
-    pub fn initPreheated(allocator: Allocator, size: usize, page_size: usize) !*PagePool {
-        var pool = try PagePool.init(allocator, page_size);
-        try pool.preheat(size);
-        return pool;
-    }
+    pool.* = .{
+        .allocator = allocator,
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .page_size = page_size,
+    };
+    return pool;
+}
 
-    pub fn deinit(pool: *PagePool) void {
-        pool.arena.deinit();
-        pool.allocator.destroy(pool);
-    }
+pub fn initPreheated(allocator: Allocator, size: usize, page_size: usize) !*PagePool {
+    var pool = try PagePool.init(allocator, page_size);
+    try pool.preheat(size);
+    return pool;
+}
 
-    pub fn acquire(pool: *PagePool) !Page {
-        if (pool.free_list) |node| {
-            pool.free_list = node.next;
-            const arr = @as([*]u8, @ptrCast(@alignCast(node)));
-            return arr[0..pool.page_size];
-        }
-        return pool.allocNew();
-    }
+pub fn deinit(pool: *PagePool) void {
+    pool.arena.deinit();
+    pool.allocator.destroy(pool);
+}
 
-    pub fn release(pool: *PagePool, page: Page) void {
-        const node: *Node = @ptrCast(@alignCast(page.ptr));
-        node.next = pool.free_list;
-        pool.free_list = node;
-    }
-
-    pub fn preheat(pool: *PagePool, size: usize) !void {
-        var i: usize = 0;
-        while (i < size) : (i += 1) {
-            const rpage = try pool.allocNew();
-            pool.release(rpage);
-        }
-    }
-
-    fn allocNew(pool: *PagePool) !Page {
-        const total_size = @max(@sizeOf(Node), @sizeOf(u8) * pool.page_size);
-        const alignment = @max(@alignOf(Node), @alignOf(u8));
-
-        const bytes = try pool.arena.allocator().alignedAlloc(u8, alignment, total_size);
-        const arr = @as([*]u8, @ptrCast(@alignCast(bytes)));
+pub fn acquire(pool: *PagePool) !RawPage {
+    if (pool.free_list) |node| {
+        pool.free_list = node.next;
+        const arr = @as([*]u8, @ptrCast(@alignCast(node)));
         return arr[0..pool.page_size];
     }
-};
+    return pool.allocNew();
+}
+
+pub fn release(pool: *PagePool, raw_page: RawPage) void {
+    const node: *Node = @ptrCast(@alignCast(raw_page.ptr));
+    node.next = pool.free_list;
+    pool.free_list = node;
+}
+
+pub fn preheat(pool: *PagePool, size: usize) !void {
+    var i: usize = 0;
+    while (i < size) : (i += 1) {
+        const rpage = try pool.allocNew();
+        pool.release(rpage);
+    }
+}
+
+fn allocNew(pool: *PagePool) !RawPage {
+    const total_size = @max(@sizeOf(Node), @sizeOf(u8) * pool.page_size);
+    const alignment = @max(@alignOf(Node), @alignOf(u8));
+
+    const bytes = try pool.arena.allocator().alignedAlloc(u8, alignment, total_size);
+    const arr = @as([*]u8, @ptrCast(@alignCast(bytes)));
+    return arr[0..pool.page_size];
+}
 
 test "acquire/release" {
     var pool = try PagePool.init(testing.allocator, 256);

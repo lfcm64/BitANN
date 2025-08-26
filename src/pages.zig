@@ -4,41 +4,114 @@ const types = @import("types.zig");
 const mem = std.mem;
 const testing = std.testing;
 
-const DBHeader = types.DBHeader;
+const Metadata = types.Metadata;
 const Collection = types.Collection;
 const Cluster = types.Cluster;
 const Vector = types.Vector;
 
-pub const Page = []u8;
+pub const RawPage = []u8;
 
 pub const PageType = enum(u8) {
+    metadata,
     collection,
     cluster,
     vector,
 };
 
+pub const PageState = enum {
+    not_initialized,
+    clean,
+    dirty,
+};
+
 pub const PageHeader = packed struct {
     page_type: PageType,
-    page_id: u32,
+    page_num: u32,
     next_page: u32,
 };
 
-pub fn db_header(page: Page) *DBHeader {
-    return @ptrCast(@alignCast(page));
-}
+pub const Page = struct {
+    fn TypeToPage(comptime page_type: PageType) type {
+        return switch (page_type) {
+            .metadata => MetadataPage,
+            .collection => CollectionPage,
+            .cluster => ClusterPage,
+            .vector => VectorPage,
+        };
+    }
 
-pub fn page_header(page: Page) *PageHeader {
-    return @ptrCast(@alignCast(page));
-}
+    fn InitParameters(comptime page_type: PageType) type {
+        return switch (page_type) {
+            .metadata => Metadata,
+            .collection => struct { page_num: u32 },
+            .cluster => struct { page_num: u32, centroid_dim: u32 },
+            .vector => struct { page_num: u32, vector_dim: u32 },
+        };
+    }
+
+    page_num: u32,
+    raw: RawPage,
+    state: PageState,
+
+    pub fn initialize(page: *Page, page_type: PageType, params: InitParameters(page_type)) !void {
+        if (page.state != .not_initialized) return error.PageAlreadyInitialized;
+
+        switch (page_type) {
+            .metadata => MetadataPage.init(page.raw, params),
+            .collection => CollectionPage.init(page.raw, params.page_num),
+            .cluster => ClusterPage.init(page.raw, params.page_num, params.centroid_dim),
+            .vector => VectorPage.init(page.raw, params.page_num, params.vector_dim),
+        }
+        page.state = .dirty;
+    }
+
+    pub fn header(page: *Page) !*PageHeader {
+        if (page.state == .not_initialized) return error.PageNotInitialized;
+
+        return @ptrCast(@alignCast(page.raw));
+    }
+
+    pub fn unwrap(page: *Page, comptime page_type: PageType) !*TypeToPage(page_type) {
+        if (page.state == .not_initialized) return error.PageNotInitialized;
+        if (page.raw[0] != @intFromEnum(page_type)) return error.WrongPageType;
+
+        return switch (page_type) {
+            .metadata => @as(*MetadataPage, @ptrCast(@alignCast(page.raw))),
+            .collection => @as(*CollectionPage, @ptrCast(@alignCast(page.raw))),
+            .cluster => @as(*ClusterPage, @ptrCast(@alignCast(page.raw))),
+            .vector => @as(*VectorPage, @ptrCast(@alignCast(page.raw))),
+        };
+    }
+
+    pub fn signal_change(page: *Page) void {
+        page.state = .dirty;
+    }
+};
+
+pub const MetadataPage = struct {
+    header: PageHeader,
+    meta: Metadata,
+
+    pub fn init(raw: RawPage, meta: Metadata) void {
+        const page: *MetadataPage = @ptrCast(@alignCast(raw));
+        page.header = PageHeader{
+            .page_type = .metadata,
+            .page_num = 0,
+            .next_page = 0,
+        };
+        page.meta = meta;
+    }
+};
 
 pub const CollectionPage = packed struct {
     header: PageHeader,
     collection_count: u32,
 
-    pub fn init(page: *CollectionPage, page_id: u32) void {
+    pub fn init(raw: RawPage, page_num: u32) void {
+        const page: *CollectionPage = @ptrCast(@alignCast(raw));
         page.header = PageHeader{
             .page_type = .collection,
-            .page_id = page_id,
+            .page_num = page_num,
             .next_page = 0,
         };
         page.collection_count = 0;
@@ -84,10 +157,6 @@ pub const CollectionPage = packed struct {
     }
 };
 
-pub fn collection_page(page: Page) *CollectionPage {
-    return @ptrCast(@alignCast(page));
-}
-
 test "initialization" {
     const page_size = 256;
     const buf = try testing.allocator.alloc(u8, page_size);
@@ -95,11 +164,11 @@ test "initialization" {
 
     @memset(buf, 1);
 
-    const page = collection_page(buf);
-    CollectionPage.init(page, 42);
+    CollectionPage.init(buf, 42);
+    const page = @as(*CollectionPage, @ptrCast(@alignCast(buf)));
 
     try testing.expectEqual(PageType.collection, page.header.page_type);
-    try testing.expectEqual(42, page.header.page_id);
+    try testing.expectEqual(42, page.header.page_num);
     try testing.expectEqual(0, page.header.next_page);
     try testing.expectEqual(0, page.collection_count);
 
@@ -117,8 +186,8 @@ test "field modification" {
 
     @memset(buf, 1);
 
-    const page = collection_page(buf);
-    CollectionPage.init(page, 42);
+    CollectionPage.init(buf, 42);
+    const page = @as(*CollectionPage, @ptrCast(@alignCast(buf)));
 
     try testing.expectEqual(0, page.header.next_page);
     try testing.expectEqual(0, mem.readInt(u32, buf[5..9], .little));
@@ -143,8 +212,8 @@ test "get/add collection" {
 
     @memset(buf, 0);
 
-    const page = collection_page(buf);
-    CollectionPage.init(page, 1);
+    CollectionPage.init(buf, 1);
+    const page = @as(*CollectionPage, @ptrCast(@alignCast(buf)));
 
     try testing.expectError(error.IndexOutOfBounds, page.get_collection(0));
 
@@ -174,14 +243,15 @@ pub const ClusterPage = packed struct {
     cluster_count: u32,
     centroid_dim: u32,
 
-    pub fn init(page: *ClusterPage, page_id: u32, vector_dimension: u32) void {
+    pub fn init(raw: RawPage, page_num: u32, centroid_dim: u32) void {
+        const page: *ClusterPage = @ptrCast(@alignCast(raw));
         page.header = PageHeader{
-            .page_type = .vector,
-            .page_id = page_id,
+            .page_type = .collection,
+            .page_num = page_num,
             .next_page = 0,
         };
         page.cluster_count = 0;
-        page.centroid_dim = vector_dimension;
+        page.centroid_dim = centroid_dim;
     }
 
     pub fn get_cluster(page: *ClusterPage, index: u32) !Cluster {
@@ -242,18 +312,15 @@ pub const ClusterPage = packed struct {
     }
 };
 
-pub fn cluster_page(page: Page) *ClusterPage {
-    return @ptrCast(@alignCast(page));
-}
-
 test "get/add cluster" {
     const page_size = 256;
     const buf = try testing.allocator.alloc(u8, page_size);
     defer testing.allocator.free(buf);
     @memset(buf, 0);
 
-    const page = cluster_page(buf);
-    ClusterPage.init(page, 1, 3);
+    ClusterPage.init(buf, 1, 3);
+    const page = @as(*ClusterPage, @ptrCast(@alignCast(buf)));
+
     try testing.expectError(error.IndexOutOfBounds, page.get_cluster(0));
 
     // Create test clusters
@@ -285,10 +352,11 @@ pub const VectorPage = packed struct {
     vector_count: u32,
     vector_dim: u32,
 
-    pub fn init(page: *VectorPage, page_id: u32, vector_dim: u32) void {
+    pub fn init(raw: RawPage, page_num: u32, vector_dim: u32) void {
+        const page: *VectorPage = @ptrCast(@alignCast(raw));
         page.header = PageHeader{
-            .page_type = .vector,
-            .page_id = page_id,
+            .page_type = .collection,
+            .page_num = page_num,
             .next_page = 0,
         };
         page.vector_count = 0;
@@ -347,18 +415,15 @@ pub const VectorPage = packed struct {
     }
 };
 
-pub fn vector_page(page: Page) *VectorPage {
-    return @ptrCast(@alignCast(page));
-}
-
 test "get/add vector" {
     const page_size = 256;
     const buf = try testing.allocator.alloc(u8, page_size);
     defer testing.allocator.free(buf);
     @memset(buf, 0);
 
-    const page = vector_page(buf);
-    VectorPage.init(page, 1, 3);
+    VectorPage.init(buf, 1, 3);
+    const page = @as(*VectorPage, @ptrCast(@alignCast(buf)));
+
     try testing.expectError(error.IndexOutOfBounds, page.get_vector(0));
 
     // Create test clusters

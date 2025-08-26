@@ -1,4 +1,4 @@
-pub const DBHeader = struct {
+pub const Metadata = struct {
     magic: [6]u8 = [6]u8{ 'a', 'b', 'c', 'd', 'e', 'f' },
     version: u16 = 1,
     page_size: u32 = 4096,
