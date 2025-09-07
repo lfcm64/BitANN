@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
     // Executable for running/testing
     const exe = b.addExecutable(.{
         .name = "bit_ann",
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
 
     // Unit tests
     const unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/test.zig"),
+        .root_source_file = b.path("src/unit_tests.zig"),
         .target = target,
         .optimize = optimize,
     });
