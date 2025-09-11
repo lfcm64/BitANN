@@ -4,13 +4,13 @@ const types = @import("types.zig");
 
 const Pager = @import("pager.zig").Pager;
 
-const assert = std.debug.assert;
-const Page = pages.Page;
+const ItemPage = pages.ItemPage;
+const Vector = types.Vector;
 
 const Item = types.Item;
 const ItemType = types.ItemType;
 
-pub fn ItemCursor(comptime item_type: ItemType) type {
+pub fn ChainedItemCursor(comptime item_type: ItemType) type {
     return struct {
         const page_type = switch (item_type) {
             .collection => pages.PageType.collection,
@@ -21,13 +21,11 @@ pub fn ItemCursor(comptime item_type: ItemType) type {
         const Cursor = @This();
 
         pager: *Pager,
-        page: *Page(page_type),
+        page: *ItemPage(item_type),
         index: u32 = 0,
 
         pub fn init(pager: *Pager, first_page_num: u32) !Cursor {
             const page = try pager.get_page(page_type, first_page_num);
-            assert(page.header.prev_page == 0);
-
             return Cursor{
                 .pager = pager,
                 .page = page,
@@ -39,13 +37,13 @@ pub fn ItemCursor(comptime item_type: ItemType) type {
         }
 
         pub fn next(cursor: *Cursor) !bool {
-            if (cursor.index < cursor.page.slots - 1) {
+            if (cursor.index < cursor.page.item_slots - 1) {
                 cursor.index += 1;
                 return true;
             }
-            if (cursor.page.header.next_page != 0) {
+            if (cursor.page.next_page != 0) {
                 const old_page = cursor.page;
-                cursor.page = try cursor.pager.get_page(page_type, old_page.header.next_page);
+                cursor.page = try cursor.pager.get_page(page_type, old_page.next_page);
                 cursor.pager.release_page(old_page);
                 cursor.index = 0;
                 return true;
@@ -60,9 +58,9 @@ pub fn ItemCursor(comptime item_type: ItemType) type {
             }
             if (cursor.page.header.prev_page != 0) {
                 const old_page = cursor.page;
-                cursor.page = try cursor.pager.get_page(page_type, old_page.header.prev_page);
+                cursor.page = try cursor.pager.get_page(page_type, old_page.prev_page);
                 cursor.pager.release_page(old_page);
-                cursor.index = cursor.page.slots - 1;
+                cursor.index = cursor.page.item_slots - 1;
                 return true;
             }
             return false;
@@ -71,51 +69,44 @@ pub fn ItemCursor(comptime item_type: ItemType) type {
         pub fn seek_to_start(cursor: *Cursor) !void {
             while (cursor.page.header.prev_page != 0) {
                 const old_page = cursor.page;
-                cursor.page = try cursor.pager.get_page(page_type, old_page.header.prev_page);
+                cursor.page = try cursor.pager.get_page(page_type, old_page.prev_page);
                 cursor.pager.release_page(old_page);
             }
             cursor.index = 0;
         }
 
         pub fn seek_to_end(cursor: *Cursor) !void {
-            while (cursor.page.header.next_page != 0) {
+            while (cursor.page.next_page != 0) {
                 const old_page = cursor.page;
-                cursor.page = try cursor.pager.get_page(page_type, old_page.header.next_page);
+                cursor.page = try cursor.pager.get_page(page_type, old_page.next_page);
                 cursor.pager.release_page(old_page);
             }
-            cursor.index = cursor.page.slots - 1;
+            cursor.index = cursor.page.item_slots - 1;
         }
 
         pub fn is_at_end(cursor: *Cursor) bool {
-            return cursor.page.header.next_page == 0 and cursor.index == cursor.page.slots - 1;
+            return cursor.page.next_page == 0 and cursor.index == cursor.page.item_slots - 1;
         }
 
-        pub fn get_current(cursor: *Cursor) ?Item(item_type) {
-            return cursor.page.item_page().get(cursor.index);
+        pub fn get_current(cursor: *Cursor) !?Item(item_type) {
+            return cursor.page.get(cursor.index);
         }
 
         pub fn is_slot_empty(cursor: *Cursor) bool {
-            return cursor.page.item_page().get(cursor.index) == null;
+            return cursor.page.get(cursor.index) == null;
         }
-
-        pub fn insert(cursor: *Cursor, item: Item(item_type)) !void {
-            try cursor.page.item_page().insert(cursor.index, item);
-        }
-
-        //pub fn update(cursor: *VectorCursor, value: []const u8) !void {}
-        //pub fn delete(cursor: *VectorCursor) !void {}
 
         pub fn next_empty_slot(cursor: *Cursor) !void {
-            while (cursor.page.item_page().is_full()) {
-                if (cursor.page.header.next_page == 0) return error.NoEmptySlots;
+            while (cursor.page.is_full()) {
+                if (cursor.page.next_page == 0) return error.NoEmptySlots;
 
                 const old_page = cursor.page;
-                cursor.page = try cursor.pager.get_page(page_type, old_page.header.next_page);
+                cursor.page = try cursor.pager.get_page(page_type, old_page.next_page);
                 cursor.pager.release_page(old_page);
                 cursor.index = 0;
             }
 
-            while (cursor.index < cursor.page.slots) {
+            while (cursor.index < cursor.page.item_slots) {
                 if (cursor.is_slot_empty()) return;
                 cursor.index += 1;
             }

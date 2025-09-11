@@ -1,5 +1,5 @@
 test {
-    _ = @import("io.zig");
+    _ = @import("storage.zig");
     _ = @import("pool.zig");
     _ = @import("cache.zig");
     _ = @import("pages.zig");

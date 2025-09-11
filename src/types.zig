@@ -12,38 +12,13 @@ pub const Metadata = struct {
     pub fn validate(_: *Metadata) void {}
 };
 
-pub const Index = union(enum) {
-    flat: packed struct {
-        first_vector_page: u32,
-    },
-
-    pub fn eql(a: Index, b: Index) bool {
-        return switch (a) {
-            .flat => |a_flat| switch (b) {
-                .flat => |b_flat| a_flat.first_vector_page == b_flat.first_vector_page,
-            },
-        };
-    }
+pub const IndexType = enum(u8) {
+    flat,
+    ivf,
 };
 
-pub const Quantization = union(enum) {
-    none: packed struct {
-        dimension: u32,
-    },
-
-    pub fn data_size(quant: Quantization) usize {
-        return switch (quant) {
-            .none => |none| none.dimension * @sizeOf(f32),
-        };
-    }
-
-    pub fn eql(a: Quantization, b: Quantization) bool {
-        return switch (a) {
-            .none => |a_none| switch (b) {
-                .none => |b_none| a_none.dimension == b_none.dimension,
-            },
-        };
-    }
+pub const QuantizationType = enum(u8) {
+    none,
 };
 
 pub const ItemType = enum {
@@ -54,55 +29,81 @@ pub const ItemType = enum {
 
 pub fn Item(comptime item_type: ItemType) type {
     return switch (item_type) {
-        .collection => Collection,
-        .cluster => Cluster,
-        .vector => Vector,
+        .collection => StoredCollection,
+        .cluster => StoredCluster,
+        .vector => StoredVector,
     };
 }
 
-pub const Collection = struct {
+pub const StoredCollection = packed struct {
     id: u32,
-    vector_count: u32,
-    index: Index,
-    quantization: Quantization,
+    dimensions: u32,
+    quant: QuantizationType,
+    index: IndexType,
+    first_child_page: u32,
 
-    pub fn eql(a: Collection, b: Collection) bool {
-        return a.id == b.id and
-            a.vector_count == b.vector_count and
-            a.index.eql(b.index) and
-            a.quantization.eql(b.quantization);
+    pub fn serialize(collection: *const StoredCollection, buf: []u8) !void {
+        var stream = std.io.fixedBufferStream(buf);
+        var writer = stream.writer();
+
+        try writer.writeInt(u32, collection.id, .little);
+        try writer.writeInt(u32, collection.dimensions, .little);
+        try writer.writeInt(u8, @intFromEnum(collection.quant), .little);
+        try writer.writeInt(u32, collection.first_child_page, .little);
+    }
+
+    pub fn deserialize(buf: []const u8) StoredCollection {
+        return StoredCollection{
+            .id = std.mem.readInt(u32, buf[0..4], .little),
+            .dimensions = std.mem.readInt(u32, buf[4..8], .little),
+            .quant = @enumFromInt(std.mem.readInt(u8, buf[8..9], .little)),
+            .index = IndexType.flat, // Placeholder, to be implemented
+            .first_child_page = std.mem.readInt(u32, buf[9..13], .little),
+        };
     }
 };
 
-pub const Cluster = struct {
-    first_vector_page: u32,
-    vector_count: u32,
-    quantization: Quantization,
-    position: []u8,
+pub const StoredCluster = struct {
+    first_child_page: u32,
+    position_data: []const u8,
 
-    pub fn eql(a: Cluster, b: Cluster) bool {
-        if (a.first_vector_page != b.first_vector_page or a.vector_count != b.vector_count) {
-            return false;
-        }
-        if (!a.quantization.eql(b.quantization)) {
-            return false;
-        }
-        return std.mem.eql(u8, a.position, b.position);
+    pub fn serialize(cluster: *const StoredCluster, buf: []u8) !void {
+        var stream = std.io.fixedBufferStream(buf);
+        var writer = stream.writer();
+
+        try writer.writeInt(u32, cluster.first_vector_page, .little);
+        try writer.writeAll(cluster.position_data);
+    }
+
+    pub fn deserialize(buf: []const u8) StoredCluster {
+        return StoredCluster{
+            .first_vector_page = std.mem.readInt(u32, buf[0..4], .little),
+            .position_data = buf[4..],
+        };
     }
 };
 
 pub const Vector = struct {
     id: u32,
-    quantization: Quantization,
-    position: []u8,
+    position: []f32,
+};
 
-    pub fn eql(a: Vector, b: Vector) bool {
-        if (a.id != b.id) {
-            return false;
-        }
-        if (!a.quantization.eql(b.quantization)) {
-            return false;
-        }
-        return std.mem.eql(u8, a.position, b.position);
+pub const StoredVector = struct {
+    id: u32,
+    position_data: []const u8,
+
+    pub fn serialize(vec: *const StoredVector, buf: []u8) !void {
+        var stream = std.io.fixedBufferStream(buf);
+        var writer = stream.writer();
+
+        try writer.writeInt(u32, vec.id, .little);
+        try writer.writeAll(vec.position_data);
+    }
+
+    pub fn deserialize(buf: []const u8) StoredVector {
+        return StoredVector{
+            .id = std.mem.readInt(u32, buf[0..4], .little),
+            .position_data = buf[4..],
+        };
     }
 };

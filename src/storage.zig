@@ -24,7 +24,7 @@ pub const Storage = struct {
 
         const meta = Metadata{};
         const meta_page = pages.MetadataPage{
-            .header = .{ .next_page = 0, .page_num = 0, .page_type = .metadata, .prev_page = 0 },
+            .header = .{ .page_num = 0, .page_type = .metadata },
             .meta = meta,
         };
 

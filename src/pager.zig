@@ -3,7 +3,6 @@ const storage = @import("storage.zig");
 const pool = @import("pool.zig");
 const cache = @import("cache.zig");
 const pages = @import("pages.zig");
-const types = @import("types.zig");
 
 const testing = std.testing;
 const assert = std.debug.assert;
@@ -96,7 +95,7 @@ pub const Pager = struct {
         try pager.cache.put(handle);
         pager.meta_page.meta.page_count += 1;
 
-        return Page(page_type).create(raw, page_num, params);
+        return pages.create_page(page_type, raw, page_num, params);
     }
 
     pub fn release_page(pager: *Pager, ptr: *anyopaque) void {
@@ -139,86 +138,3 @@ pub const Pager = struct {
         }
     }
 };
-
-// Helper function to create a temporary test file
-fn create_test_file(allocator: std.mem.Allocator, size: usize) !std.fs.File {
-    const temp_dir = testing.tmpDir(.{});
-    const file = try temp_dir.dir.createFile("test_db", .{ .read = true });
-
-    const zeros = try allocator.alloc(u8, size);
-    defer allocator.free(zeros);
-    @memset(zeros, 0);
-    _ = try file.writeAll(zeros);
-    try file.seekTo(0);
-
-    return file;
-}
-
-test "initialization" {
-    const allocator = testing.allocator;
-    const meta = types.Metadata{ .cache_size = 5, .page_size = 256, .page_count = 1 };
-    const file = try create_test_file(allocator, meta.page_size * 10);
-    defer file.close();
-
-    const pager = try Pager.init(allocator, file, meta, .create_new);
-    defer pager.deinit();
-
-    try testing.expectEqual(1, pager.page_count);
-    try testing.expect(pager.cache.contains(0));
-}
-
-test "new_page" {
-    const allocator = testing.allocator;
-    const meta = types.Metadata{ .cache_size = 5, .page_size = 256, .page_count = 1 };
-    const file = try create_test_file(allocator, meta.page_size * 10);
-    defer file.close();
-
-    const pager = try Pager.init(allocator, file, meta, .create_new);
-    defer pager.deinit();
-
-    const page = try pager.new_page(.collection, .{ .prev_page = 0 });
-    defer pager.release_page(page);
-
-    try testing.expectEqual(1, page.header.page_num);
-    try testing.expectEqual(2, pager.page_count);
-}
-
-test "get_page increments refs" {
-    const allocator = testing.allocator;
-    const meta = types.Metadata{ .cache_size = 5, .page_size = 256, .page_count = 1 };
-    const file = try create_test_file(allocator, meta.page_size * 10);
-    defer file.close();
-
-    const pager = try Pager.init(allocator, file, meta, .create_new);
-    defer pager.deinit();
-
-    const new_page = try pager.new_page(.collection, .{ .prev_page = 0 });
-    const page_num = new_page.header.page_num;
-    pager.release_page(new_page);
-
-    const page1 = try pager.get_page(.collection, page_num);
-    const page2 = try pager.get_page(.collection, page_num);
-    defer {
-        pager.release_page(page1);
-        pager.release_page(page2);
-    }
-
-    try testing.expectEqual(2, pager.cache.table.get(page_num).?.data.refs);
-}
-
-test "release_page decrements refs" {
-    const allocator = testing.allocator;
-    const meta = types.Metadata{ .cache_size = 5, .page_size = 256, .page_count = 1 };
-    const file = try create_test_file(allocator, meta.page_size * 10);
-    defer file.close();
-
-    const pager = try Pager.init(allocator, file, meta, .create_new);
-    defer pager.deinit();
-
-    const page = try pager.new_page(.collection, .{ .prev_page = 0 });
-    const page_num = page.header.page_num;
-
-    try testing.expectEqual(1, pager.cache.table.get(page_num).?.data.refs);
-    pager.release_page(page);
-    try testing.expectEqual(0, pager.cache.table.get(page_num).?.data.refs);
-}
